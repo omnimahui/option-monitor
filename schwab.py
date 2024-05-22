@@ -259,8 +259,9 @@ class Schwab(Exchange):
             option_data = chain_obj.putExpDateMap.values().__iter__().__next__().values().__iter__().__next__()[0]
         option.price = round((option_data.ask + option_data.bid) / 2, 2)
         option.daysToExpiration = option_data.daysToExpiration
-        option.intrinsic = option_data.intrinsicValue
-        option.extrinsic = option_data.extrinsicValue
+        option.intrinsic = max(option.underlyingPrice - option.strike,0) if option.callput == 'CALL' \
+                                      else max(option.strike - option.underlyingPrice,0)
+        option.extrinsic = option.price - option.intrinsic
         option.itm = 1 if option_data.inTheMoney == True else 0
         option.actionNeed = 1 if (option.itm == 1 and  option.daysToExpiration <= 5) or (option.extrinsic <= option.strike / 100) else 0
         option.daysToER = int((datetime.strptime(getERdate2(option.underlying), '%Y-%m-%d').date()-date.today()).days)
