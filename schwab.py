@@ -40,7 +40,7 @@ UNIFIED_OPTION_PATTERN = r'([a-zA-Z]+)_(\d+)([C|P])(\d+\.?\d*)'
 
 def getERdate2(symbol):
     finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
-    er_dates = (finnhub_client.earnings_calendar(_from=date.today(), to=date.today()+timedelta(days=100), 
+    er_dates = (finnhub_client.earnings_calendar(_from=date.today()-timedelta(days=1), to=date.today()+timedelta(days=100), 
                                                  symbol=symbol, international=False))
 
     return er_dates['earningsCalendar'][-1]['date']
