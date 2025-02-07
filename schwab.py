@@ -34,16 +34,22 @@ from settings import  (SCHWAB_APP_KEY,
                        SMTP_PASS)
 
 
-APIKEY='XBWVYK0P2CHDHRGHFLOHXO79BDMK1PFZ'
 
-UNIFIED_OPTION_PATTERN = r'([a-zA-Z]+)_(\d+)([C|P])(\d+\.?\d*)'
+
+UNIFIED_OPTION_PATTERN = r'([a-zA-Z]+)(\d*)_(\d+)([C|P])(\d+\.?\d*)'
 
 def getERdate2(symbol):
     finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
-    er_dates = (finnhub_client.earnings_calendar(_from=date.today()-timedelta(days=1), to=date.today()+timedelta(days=100), 
-                                                 symbol=symbol, international=False))
-
-    return er_dates['earningsCalendar'][-1]['date']
+    try: 
+        er_dates = (finnhub_client.earnings_calendar(_from=date.today() - timedelta(days=1), to=date.today()+timedelta(days=100), 
+                                                     symbol=symbol, international=False))
+        time.sleep(1)                                                
+    except:
+        er_dates = {}
+    if not er_dates or not er_dates['earningsCalendar']:
+        return '2099-12-31'
+    else:
+        return er_dates['earningsCalendar'][-1]['date']
 
 
 class Option():
@@ -51,9 +57,10 @@ class Option():
     def __init__(self, symbol):
         m = re.compile(UNIFIED_OPTION_PATTERN).search(symbol)
         self.underlying = m.group(1)
-        self.exp = datetime.strptime(m.group(2), '%y%m%d')
-        self.callput = 'CALL' if m.group(3) == 'C'  else 'PUT'
-        self.strike = float(m.group(4))
+        self.optional_digit = m.group(2)
+        self.exp = datetime.strptime(m.group(3), '%y%m%d')
+        self.callput = 'CALL' if m.group(4) == 'C'  else 'PUT'
+        self.strike = float(m.group(5))
         self.price = 0
         self.underlyingPrice = 0
         self.daysToExpiration = 0
@@ -146,9 +153,9 @@ class Schwab(Exchange):
     def __init__(self):
         super().__init__()
         self.access_token = ""
-        self.account_number = ""
+        self.account_number = []
         self.base_url = "https://api.schwabapi.com"
-        self.option_pattern = r'([a-zA-Z]+)\s+(\d+)([C|P])(\d+\.?\d*)'
+        self.option_pattern = r'([a-zA-Z]+)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)'
         self.auth()
         
     def auth(self) -> str:
@@ -174,22 +181,27 @@ class Schwab(Exchange):
     def get_account_number_hash_value(self) -> str:
         url = f"{self.base_url}/trader/v1/accounts/accountNumbers"
         response = self.send_request(url)
-        self.account_number = response[0].hashValue
+        for i in range(len(response)):
+            self.account_number.append(response[i].hashValue)
         return self.account_number
     
     def parse_positions(self, positions):
         l = []
         for pos in positions:
             if pos.instrument.assetType == 'OPTION':
-                m = re.compile(self.option_pattern).search(pos.instrument.symbol)
-                underlying = m.group(1)
-                exp = m.group(2)
-                callput = m.group(3)
-                strike = round(float(m.group(4)) / 1000, 2)
-                symbol = f"{underlying}_{exp}{callput}{strike}" #normalize option symbol
-                pos = Position(symbol, "OPTION", pos.longQuantity-pos.shortQuantity)
-                l.append(pos)
-            elif pos.instrument.assetType == 'EQUITY':
+                try:
+                    m = re.compile(self.option_pattern).search(pos.instrument.symbol)
+                    underlying = m.group(1)
+                    optional_digit = m.group(2)
+                    exp = m.group(3)
+                    callput = m.group(4)
+                    strike = round(float(m.group(5)) / 1000, 2)
+                    symbol = f"{underlying}{optional_digit}_{exp}{callput}{strike}" #normalize option symbol
+                    pos = Position(symbol, "OPTION", pos.longQuantity-pos.shortQuantity)
+                    l.append(pos)
+                except Exception as ex:
+                    print (f"{pos.instrument.symbol} {ex}" )
+            elif pos.instrument.assetType == 'EQUITY' or pos.instrument.assetType == 'COLLECTIVE_INVESTMENT':
                 pos = Position(pos.instrument.symbol, "STOCK", pos.longQuantity-pos.shortQuantity)
                 l.append(pos)
         return l
@@ -216,10 +228,15 @@ class Schwab(Exchange):
       
     def get_positions(self) -> dict:
         self.get_account_number_hash_value()
-        url =  f"{self.base_url}/trader/v1/accounts/{self.account_number}?fields=positions"
-        response = self.send_request(url)
-        self.pos_list =self.parse_positions(response.securitiesAccount.positions)
-        self.pos_list.append(Position("SchWab","CASH",response.securitiesAccount.initialBalances.cashBalance))
+        self.pos_list = []
+        i = 0
+        for acct in self.account_number:
+            url =  f"{self.base_url}/trader/v1/accounts/{acct}?fields=positions"
+            response = self.send_request(url)
+            self.pos =self.parse_positions(response.securitiesAccount.positions)
+            self.pos.append(Position(f"SchWab{i}","CASH",response.securitiesAccount.initialBalances.cashBalance))
+            self.pos_list.extend(self.pos)
+            i = i + 1
         return self.pos_list
         
     def get_quote_obj(self, symbol, equity_type):
@@ -319,7 +336,8 @@ def build_stock_table(portf):
         if pos.equity_type != 'STOCK':
             continue
         row = {'Symbol':pos.symbol,
-                  'Quantity': pos.quantity} 
+                  'Quantity': pos.quantity,
+                  'DaysToER': int((datetime.strptime(getERdate2(pos.symbol), '%Y-%m-%d').date()-date.today()).days)} 
         rows.append(row)
     df = pd.DataFrame.from_records(rows)
     df['Delta'] = 1
