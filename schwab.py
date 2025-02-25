@@ -24,15 +24,20 @@ import smtplib
 import sys
 import os
 import base64
-from settings import  (SCHWAB_APP_KEY,
-                       SCHWAB_APP_SECRET,
-                       SCHWAB_REFRESH_TOKEN,
-                       FINNHUB_KEY,
-                       SMTP_SERVER,
-                       SMTP_PORT,
-                       SMTP_USER,
-                       SMTP_PASS)
-
+from settings import (
+    SCHWAB_APP_KEY,
+    SCHWAB_APP_SECRET,
+    SCHWAB_REFRESH_TOKEN,
+    FINNHUB_KEY,
+    SMTP_SERVER,
+    SMTP_PORT,
+    SMTP_USER,
+    SMTP_PASS,
+    TRADESTATION_FRESHTOKEN,
+    TRADESTATION_KEY,
+    TRADESTATION_SECRET,
+    TRADESTATION_ACCOUNTID,
+)
 
 
 
@@ -58,8 +63,8 @@ class Option():
         m = re.compile(UNIFIED_OPTION_PATTERN).search(symbol)
         self.underlying = m.group(1)
         self.optional_digit = m.group(2)
-        self.exp = datetime.strptime(m.group(3), '%y%m%d')
-        self.callput = 'CALL' if m.group(4) == 'C'  else 'PUT'
+        self.exp = datetime.strptime(m.group(3), "%y%m%d")
+        self.callput = "CALL" if m.group(4) == "C" else "PUT"
         self.strike = float(m.group(5))
         self.price = 0
         self.underlyingPrice = 0
@@ -75,9 +80,7 @@ class Option():
         self.vega = 0
         self.openInterest = 0
         self.volatility = 0
-        
-        
-        
+
 
 class Position():
     def __init__(self, symbol, equity_type, quantity):
@@ -115,10 +118,10 @@ class Exchange():
 class Fidelity(Exchange):
     def __init__(self):
         super().__init__()
-        self.money_pattern = r'^FDRXX.*|^SPAXX.*'
-        self.option_pattern = r'[^a-zA-Z]*([a-zA-Z]*)(\d{6})([C|P]\d+\.?\d*)'
+        self.money_pattern = r"^FDRXX.*|^SPAXX.*"
+        self.option_pattern = r"[^a-zA-Z]*([a-zA-Z]*)(\d{6})([C|P]\d+\.?\d*)"
         return
-   
+
     def get_positions(self):
         curr_dir = os.path.dirname(__file__)
         for f in [f"{curr_dir}/fidelity18-ira.csv", f"{curr_dir}/fidelity18-roth.csv", f"{curr_dir}/fidelity20.csv"]:        
@@ -145,9 +148,92 @@ class Fidelity(Exchange):
                     df.loc[df['Symbol'] == s, 'Account Name'].values[0].lower() == 'TRADITIONAL IRA'.lower()):
                         pos = Position(s, "STOCK", df.loc[df['Symbol'] == s, 'Quantity'].values[0])
                         self.pos_list.append(pos)
-                        
+
         return self.pos_list
-   
+
+
+class TradeStation(Exchange):
+    def __init__(self):
+        super().__init__()
+        self.access_token = ""
+        self.option_pattern = r"([a-zA-Z]+)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
+        self.base_url = "https://api.tradestation.com"
+        self.auth()
+
+    def auth(self) -> str:
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        payload = {
+            "grant_type": "refresh_token",
+            "refresh_token": TRADESTATION_FRESHTOKEN,
+            "client_id": TRADESTATION_KEY,
+            "client_secret": TRADESTATION_SECRET,
+        }
+        response = requests.post(
+            url="https://signin.tradestation.com/oauth/token",
+            headers=headers,
+            data=payload,
+        )
+        if response.status_code == 200:
+            self.access_token = response.json()["access_token"]
+            return self.access_token
+        else:
+            return ""
+
+    def send_request(self, url):
+        response = requests.get(
+            url, headers={"Authorization": "Bearer " + self.access_token}
+        )
+        if response.status_code == 200:
+            return DefaultMunch.fromDict(response.json())
+        else:
+            raise Exception(response.status_code)
+
+    def parse_positions(self, positions):
+        l = []
+        for pos in positions:
+            if pos.AssetType == "OPTION":
+                try:
+                    m = re.compile(self.option_pattern).search(pos.instrument.symbol)
+                    underlying = m.group(1)
+                    optional_digit = m.group(2)
+                    exp = m.group(3)
+                    callput = m.group(4)
+                    strike = round(float(m.group(5)) / 1000, 2)
+                    symbol = f"{underlying}{optional_digit}_{exp}{callput}{strike}"  # normalize option symbol
+                    pos = Position(
+                        symbol, "OPTION", pos.longQuantity - pos.shortQuantity
+                    )
+                    l.append(pos)
+                except Exception as ex:
+                    print(f"{pos.instrument.symbol} {ex}")
+            elif pos.AssetType == "STOCK":
+                pos = Position(pos.Symbol, "STOCK", float(pos.Quantity))
+                l.append(pos)
+        return l
+
+    def get_positions(self) -> dict:
+        self.pos_list = []
+        url = (
+            f"{self.base_url}/v3/brokerage/accounts/{TRADESTATION_ACCOUNTID}/positions"
+        )
+        response = self.send_request(url)
+        self.pos = self.parse_positions(response.Positions)
+
+        url = f"{self.base_url}/v3/brokerage/accounts/{TRADESTATION_ACCOUNTID}/balances"
+        response = self.send_request(url)
+        self.pos.append(
+            Position(
+                f"TradeStation",
+                "CASH",
+                response.Balances[0].CashBalance,
+            )
+        )
+        self.pos_list.extend(self.pos)
+
+        return self.pos_list
+
 
 class Schwab(Exchange):
     def __init__(self):
@@ -155,9 +241,9 @@ class Schwab(Exchange):
         self.access_token = ""
         self.account_number = []
         self.base_url = "https://api.schwabapi.com"
-        self.option_pattern = r'([a-zA-Z]+)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)'
+        self.option_pattern = r"([a-zA-Z]+)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
         self.auth()
-        
+
     def auth(self) -> str:
         headers = {
             "Authorization": f'Basic {base64.b64encode(f"{SCHWAB_APP_KEY}:{SCHWAB_APP_SECRET}".encode()).decode()}',
@@ -166,29 +252,29 @@ class Schwab(Exchange):
         payload = {
             "grant_type": "refresh_token",
             "refresh_token": SCHWAB_REFRESH_TOKEN,
-        }    
+        }
         response = requests.post(
             url="https://api.schwabapi.com/v1/oauth/token",
             headers=headers,
             data=payload,
         )
         if response.status_code == 200:
-            self.access_token = response.json()['access_token']
+            self.access_token = response.json()["access_token"]
             return self.access_token
         else:
-            return ""        
-        
+            return ""
+
     def get_account_number_hash_value(self) -> str:
         url = f"{self.base_url}/trader/v1/accounts/accountNumbers"
         response = self.send_request(url)
         for i in range(len(response)):
             self.account_number.append(response[i].hashValue)
         return self.account_number
-    
+
     def parse_positions(self, positions):
         l = []
         for pos in positions:
-            if pos.instrument.assetType == 'OPTION':
+            if pos.instrument.assetType == "OPTION":
                 try:
                     m = re.compile(self.option_pattern).search(pos.instrument.symbol)
                     underlying = m.group(1)
@@ -196,26 +282,34 @@ class Schwab(Exchange):
                     exp = m.group(3)
                     callput = m.group(4)
                     strike = round(float(m.group(5)) / 1000, 2)
-                    symbol = f"{underlying}{optional_digit}_{exp}{callput}{strike}" #normalize option symbol
-                    pos = Position(symbol, "OPTION", pos.longQuantity-pos.shortQuantity)
+                    symbol = f"{underlying}{optional_digit}_{exp}{callput}{strike}"  # normalize option symbol
+                    pos = Position(
+                        symbol, "OPTION", pos.longQuantity - pos.shortQuantity
+                    )
                     l.append(pos)
                 except Exception as ex:
-                    print (f"{pos.instrument.symbol} {ex}" )
-            elif pos.instrument.assetType == 'EQUITY' or pos.instrument.assetType == 'COLLECTIVE_INVESTMENT':
-                pos = Position(pos.instrument.symbol, "STOCK", pos.longQuantity-pos.shortQuantity)
+                    print(f"{pos.instrument.symbol} {ex}")
+            elif (
+                pos.instrument.assetType == "EQUITY"
+                or pos.instrument.assetType == "COLLECTIVE_INVESTMENT"
+            ):
+                pos = Position(
+                    pos.instrument.symbol, "STOCK", pos.longQuantity - pos.shortQuantity
+                )
                 l.append(pos)
         return l
-    
+
     def send_request(self, url):
-        response = requests.get(url, 
-                                headers={'Authorization': "Bearer "+self.access_token})
+        response = requests.get(
+            url, headers={"Authorization": "Bearer " + self.access_token}
+        )
         if response.status_code == 200:
             return DefaultMunch.fromDict(response.json())
         else:
             raise Exception(response.status_code)
         
         return response
- 
+
     def schwab_option_symbol(self, symbol):
         m = re.compile(UNIFIED_OPTION_PATTERN).search(symbol)
         underlying = m.group(1)
@@ -231,10 +325,16 @@ class Schwab(Exchange):
         self.pos_list = []
         i = 0
         for acct in self.account_number:
-            url =  f"{self.base_url}/trader/v1/accounts/{acct}?fields=positions"
+            url = f"{self.base_url}/trader/v1/accounts/{acct}?fields=positions"
             response = self.send_request(url)
-            self.pos =self.parse_positions(response.securitiesAccount.positions)
-            self.pos.append(Position(f"SchWab{i}","CASH",response.securitiesAccount.initialBalances.cashBalance))
+            self.pos = self.parse_positions(response.securitiesAccount.positions)
+            self.pos.append(
+                Position(
+                    f"SchWab{i}",
+                    "CASH",
+                    response.securitiesAccount.initialBalances.cashBalance,
+                )
+            )
             self.pos_list.extend(self.pos)
             i = i + 1
         return self.pos_list
@@ -265,6 +365,7 @@ class Schwab(Exchange):
         return chain_obj
     
     def load_option_properties(self, pos):
+        #print (pos.symbol)
         if pos.equity_type != 'OPTION':
             return pos
         option= Option(pos.symbol)
@@ -405,12 +506,15 @@ def esp(group_df):
     d['Covercall_capability'] = group_df.loc[group_df['CallPut']== 'CALL']['Quantity'].sum() + math.floor(group_df.loc[group_df['CallPut']== 'STOCK']['Quantity'].sum()/100)
     return pd.Series(d, index=['Delta', 'Gamma', 'Vega', 'Theta','Covercall_capability'])
 
+tradestation = TradeStation()
+positions_tradestation = tradestation.get_positions()
+
 schwab = Schwab()
 positions_schwab=schwab.get_positions()
 positions_fidelity = Fidelity().get_positions()
 portf = Portfolio()
-for positions in [positions_schwab, positions_fidelity]:
-    for pos in  positions:
+for positions in [positions_schwab, positions_fidelity, positions_tradestation]:
+    for pos in positions:
         pos = schwab.load_option_properties(pos)
         portf.add(pos)
         
