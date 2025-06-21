@@ -40,7 +40,7 @@ from settings import (
     TRADESTATION_SECRET,
     TRADESTATION_ACCOUNTID,
 )
-
+import yfinance as yf
 
 UNIFIED_OPTION_PATTERN = r"([a-zA-Z]+)(\d*)_(\d+)([C|P])(\d+\.?\d*)"
 
@@ -86,6 +86,19 @@ class Option:
         self.vega = 0
         self.openInterest = 0
         self.volatility = 0
+        self.underlying_volatility = 0
+        self.Xstd = 0
+
+    def is_expired(self):
+        # Compare with today's date
+        return self.exp < datetime.now()
+
+    def download_underlying_OHLC(self):
+        return yf.download(
+            tickers=self.underlying,
+            start=datetime.today() - timedelta(days=365),
+            interval="1d",
+        )
 
 
 class Position:
@@ -533,6 +546,8 @@ class Schwab(Exchange):
         if pos.equity_type != "OPTION":
             return pos
         option = Option(pos.symbol)
+        if option.is_expired():
+            return None
         chain_obj = self.get_chain_obj(option)
         option.underlyingPrice = chain_obj.underlyingPrice
         if option.callput == "CALL":
@@ -580,7 +595,16 @@ class Schwab(Exchange):
         option.vega = option_data.vega
         option.openInterest = option_data.openInterest
         option.volatility = option_data.volatility
-
+        option.underlying_volatility = round(
+            option.download_underlying_OHLC()["Close"].std().values[0],
+            2,
+        )
+        option.Xstd = abs(
+            round(
+                (option.strike - option.underlyingPrice) / option.underlying_volatility,
+                2,
+            )
+        )
         pos.property = option
 
         return pos
@@ -605,6 +629,7 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
             "CallPut": option.callput,
             "Strike": option.strike,
             "Underlying": option.underlyingPrice,
+            "Xstd": option.Xstd,
             "Exp": option.exp,
             "Delta": option.delta,
             "Gamma": option.gamma,
@@ -663,7 +688,7 @@ def build_cash_table(portf):
         row = {"Symbol": pos.symbol, "Quantity": pos.quantity}
         rows.append(row)
     df = pd.DataFrame.from_records(rows)
-    new_row = {'Symbol': 'Total', 'Quantity': df['Quantity'].astype(float).sum()}
+    new_row = {"Symbol": "Total", "Quantity": df["Quantity"].astype(float).sum()}
     df.loc[len(df)] = new_row
     return df
 
@@ -746,7 +771,8 @@ for positions in [
 ]:
     for pos in positions:
         pos = schwab.load_option_properties(pos)
-        portf.add(pos)
+        if pos:
+            portf.add(pos)
 
 
 option_df = build_option_table(portf, schwab)
