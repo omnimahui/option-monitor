@@ -91,7 +91,7 @@ class Option:
 
     def is_expired(self):
         # Compare with today's date
-        return self.exp < datetime.now()
+        return self.exp + timedelta(days=1) < datetime.now()
 
     def download_underlying_OHLC(self):
         return yf.download(
@@ -617,6 +617,11 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
         if pos.equity_type != "OPTION":
             continue
         option = pos.property
+        apr = round(
+            (option.extrinsic * 100 / (option.strike * 100))
+            * (365 / (option.daysToExpiration + 1))
+            * 100
+        )
         row = {
             "Symbol": option.underlying,
             "Action": option.actionNeed,
@@ -626,6 +631,7 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
             "DaysToER": option.daysToER,
             "Quantity": pos.quantity,
             "Extrinsic": option.extrinsic,
+            "APR(%)": apr,
             "CallPut": option.callput,
             "Strike": option.strike,
             "Underlying": option.underlyingPrice,
