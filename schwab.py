@@ -621,6 +621,7 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
             (option.extrinsic * 100 / (option.strike * 100))
             * (365 / (option.daysToExpiration + 1))
             * 100
+            * (-1 if pos.quantity > 0 else 1)
         )
         row = {
             "Symbol": option.underlying,
