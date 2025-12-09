@@ -451,6 +451,8 @@ class Schwab(Exchange):
 
     def parse_positions(self, positions):
         l = []
+        if positions is None:
+            return l
         for pos in positions:
             if pos.instrument.assetType == "OPTION":
                 try:
@@ -542,6 +544,39 @@ class Schwab(Exchange):
             chain_obj = None
         return chain_obj
 
+    def get_full_chain_obj(self, underlying, callput, from_date=None, to_date=None, days_out=45):
+        """
+        Get full option chain for rollover analysis
+        Args:
+            underlying: stock symbol
+            callput: "CALL" or "PUT"
+            from_date: start date (defaults to today)
+            to_date: end date (defaults to days_out)
+            days_out: number of days to fetch (default 45, can extend to 90+ for fallback)
+        """
+        if from_date is None:
+            from_date = datetime.today().strftime("%Y-%m-%d")
+        if to_date is None:
+            to_date = (datetime.today() + timedelta(days=days_out)).strftime("%Y-%m-%d")
+
+        # Don't filter by strike to get all available options
+        url = f"{self.base_url}/marketdata/v1/chains?symbol={underlying}&contractType={callput}&fromDate={from_date}&toDate={to_date}"
+        print(f"  Fetching chain: {url}")
+        response = self.send_request(url)
+
+        if response:
+            # Debug: show what date ranges we actually got back
+            if callput == "CALL":
+                exp_map = response.callExpDateMap if hasattr(response, 'callExpDateMap') else {}
+            else:
+                exp_map = response.putExpDateMap if hasattr(response, 'putExpDateMap') else {}
+
+            if exp_map:
+                dates = list(exp_map.keys())
+                print(f"  Received {len(dates)} expiration dates from API")
+
+        return response if response else None
+
     def load_option_properties(self, pos):
         if pos.equity_type != "OPTION":
             return pos
@@ -609,34 +644,327 @@ class Schwab(Exchange):
 
         return pos
 
+    def find_best_rollover(self, current_option: Option, position_quantity: int, action_needed: int):
+        """
+        Find best rollover option when Action is 1
+        Args:
+            current_option: the current option position
+            position_quantity: number of contracts (negative for short positions)
+            action_needed: the actionNeed flag (1 = needs action)
+        Returns:
+            dict with rollover recommendation or None
+        """
+        # Only consider rollover for short positions (quantity < 0)
+        if position_quantity >= 0:
+            return None
+
+        # Only evaluate rollover if Action is 1
+        if action_needed != 1:
+            print(f"  No action needed (Action={action_needed})")
+            return None
+
+        print(f"  Action needed (Action=1), evaluating rollover options...")
+        print(f"  Current position: DTE={current_option.daysToExpiration}, Strike=${current_option.strike}, Extrinsic=${current_option.extrinsic:.2f}")
+
+        # Try with standard criteria first (45 days), then fallback to relaxed criteria (90 days)
+        for attempt, (days_out, allow_larger_debit, min_distance) in enumerate([
+            (45, False, 2.0),  # First attempt: strict criteria
+            (90, True, 1.0),   # Second attempt: relaxed criteria - allow larger debits, closer strikes, longer DTE
+        ], start=1):
+
+            if attempt > 1:
+                print(f"  No candidates found with strict criteria. Trying fallback with relaxed criteria...")
+                print(f"    - Extending DTE range to {days_out} days")
+                print(f"    - Allowing larger debits (up to 30% of extrinsic)")
+                print(f"    - Reducing minimum distance to {min_distance}%")
+
+            try:
+                # Get full chain for the same option type
+                chain_obj = self.get_full_chain_obj(
+                    current_option.underlying,
+                    current_option.callput,
+                    from_date=datetime.today().strftime("%Y-%m-%d"),
+                    to_date=None,
+                    days_out=days_out
+                )
+
+                if not chain_obj:
+                    print(f"  No chain data available for {current_option.underlying}")
+                    continue
+
+                print(f"  Fetched chain data for {current_option.underlying}")
+
+                # Parse chain data
+                exp_date_map = chain_obj.callExpDateMap if current_option.callput == "CALL" else chain_obj.putExpDateMap
+                underlying_price = chain_obj.underlyingPrice
+
+                rollover_candidates = []
+                total_options_checked = 0
+                filtered_by_expiration = 0
+                filtered_by_pricing = 0
+                filtered_by_spread = 0
+                filtered_by_debit = 0
+
+                for exp_date_str, strikes_dict in exp_date_map.items():
+                    for strike_str, options_list in strikes_dict.items():
+                        for opt_data in options_list:
+                            total_options_checked += 1
+
+                            # Only consider options with later expiration (at least 1 day more)
+                            if opt_data.daysToExpiration <= current_option.daysToExpiration:
+                                filtered_by_expiration += 1
+                                continue
+
+                            # Prefer rollovers that add meaningful time (at least 7 days)
+                            # But still allow shorter rollovers if needed
+                            days_gained = opt_data.daysToExpiration - current_option.daysToExpiration
+
+                            # Calculate metrics
+                            bid = opt_data.bid
+                            ask = opt_data.ask
+                            mid_price = (bid + ask) / 2
+
+                            # Skip if no valid pricing
+                            if bid <= 0 or ask <= 0:
+                                filtered_by_pricing += 1
+                                continue
+
+                            # Calculate bid/ask spread percentage
+                            bid_ask_spread_pct = (ask - bid) / mid_price * 100
+
+                            # Skip if spread is too wide (> 20%)
+                            if bid_ask_spread_pct > 20:
+                                filtered_by_spread += 1
+                                continue
+
+                            # Calculate intrinsic and extrinsic value
+                            if current_option.callput == "CALL":
+                                intrinsic = max(underlying_price - opt_data.strikePrice, 0)
+                            else:
+                                intrinsic = max(opt_data.strikePrice - underlying_price, 0)
+
+                            extrinsic = mid_price - intrinsic
+
+                            # Skip ITM options (we don't want to risk assignment)
+                            if intrinsic > 0:
+                                filtered_by_debit += 1  # Use debit counter for ITM filtering
+                                continue
+
+                            # Calculate distance from current price (safety margin)
+                            # Per user requirement:
+                            # - CALL with strike > price = safe from assignment, but show as NEGATIVE distance
+                            # - PUT with strike < price = safe from assignment, but show as NEGATIVE distance
+                            # More negative = safer (further OTM)
+                            if current_option.callput == "CALL":
+                                # CALL: strike > price (OTM) should be negative
+                                distance_pct = (underlying_price - opt_data.strikePrice) / underlying_price * 100
+                                # Negative = OTM (good), Positive = ITM (bad)
+                            else:  # PUT
+                                # PUT: strike < price (OTM) should be negative
+                                distance_pct = (opt_data.strikePrice - underlying_price) / underlying_price * 100
+                                # Negative = OTM (good), Positive = ITM (bad)
+
+                            # Skip options too close to current price
+                            # Since negative = safe (OTM), we want distance_pct < -min_distance (at least min_distance% OTM)
+                            # This means: distance_pct > -min_distance is too close or ITM
+                            if distance_pct > -min_distance:
+                                filtered_by_debit += 1
+                                continue
+
+                            # Calculate net credit (what we receive from rollover)
+                            # For short positions: we buy back current (pay current.price) and sell new (receive mid_price)
+                            net_credit = mid_price - current_option.price
+
+                            # Prefer credit rollovers, but allow debits based on attempt
+                            # First attempt: allow debit up to 20% of extrinsic
+                            # Fallback attempt: allow debit up to 30% of extrinsic
+                            max_debit_pct = 0.3 if allow_larger_debit else 0.2
+                            if net_credit < 0 and abs(net_credit) > (extrinsic * max_debit_pct):
+                                filtered_by_debit += 1
+                                continue
+
+                            # Calculate extrinsic per day - key metric for comparing options across different DTEs
+                            extrinsic_per_day = extrinsic / opt_data.daysToExpiration
+
+                            # APR calculation based on extrinsic per day
+                            # This gives annualized return based on the daily income rate
+                            apr = (extrinsic_per_day * 365 / opt_data.strikePrice) * 100
+
+                            # Calculate quality score considering multiple factors
+                            # Factors: Extrinsic per Day (30%), Safety Distance (25%), Bid/Ask Spread (20%), Theta (15%), IV stability (5%), Liquidity (5%)
+
+                            # Extrinsic value score - use extrinsic per day to normalize across different DTEs
+                            # Higher extrinsic per day is better (more efficient income generation)
+                            # Normalize: assume $0.10/day per $100 strike is excellent
+                            extrinsic_per_day_pct = extrinsic_per_day / (opt_data.strikePrice / 100)
+                            extrinsic_score = min(extrinsic_per_day_pct / 0.10, 1.0) * 30
+
+                            # Safety distance score - more negative is safer (normalize to 0-25)
+                            # distance_pct is negative for OTM options
+                            # Prefer -5% to -15% distance (5-15% OTM), penalize if too far (<-20% or >-2%)
+                            abs_distance = abs(distance_pct)
+                            if abs_distance >= 5 and abs_distance <= 15:
+                                distance_score = 25
+                            elif abs_distance > 15:
+                                distance_score = max(0, 25 - (abs_distance - 15))  # Penalty for being too far OTM
+                            else:  # 2-5%
+                                distance_score = (abs_distance - 2) / 3 * 25  # Linear scale from 2-5% OTM
+
+                            # Bid/Ask spread score - smaller spread is better (normalize to 0-20)
+                            # Perfect score for spread < 5%, penalty for wider spreads
+                            if bid_ask_spread_pct <= 5:
+                                spread_score = 20
+                            elif bid_ask_spread_pct <= 10:
+                                spread_score = 20 - (bid_ask_spread_pct - 5)  # Linear penalty 5-10%
+                            else:  # 10-20%
+                                spread_score = max(0, 15 - (bid_ask_spread_pct - 10))  # Steeper penalty
+
+                            # Theta score - higher theta decay is better (normalize to 0-15)
+                            theta_score = min(abs(opt_data.theta) / 1.0, 1.0) * 15
+
+                            # IV stability score - similar IV is better (normalize to 0-5)
+                            iv_diff = abs(opt_data.volatility - current_option.volatility) / max(current_option.volatility, 0.01)
+                            iv_score = (1 - min(iv_diff, 1.0)) * 5
+
+                            # Liquidity score - higher OI is better (normalize to 0-5)
+                            liquidity_score = min(opt_data.openInterest / 100, 1.0) * 5
+
+                            quality_score = extrinsic_score + distance_score + spread_score + theta_score + iv_score + liquidity_score
+
+                            # Parse expiration date - handle both formats
+                            exp_date_str = opt_data.expirationDate
+                            if 'T' in exp_date_str:
+                                # Has timestamp, extract just the date part
+                                exp_date_str = exp_date_str.split('T')[0]
+                            expiration_dt = datetime.strptime(exp_date_str, "%Y-%m-%d")
+
+                            rollover_candidates.append({
+                                'strike': opt_data.strikePrice,
+                                'expiration': expiration_dt,
+                                'dte': opt_data.daysToExpiration,
+                                'bid': bid,
+                                'ask': ask,
+                                'mid_price': mid_price,
+                                'bid_ask_spread_pct': bid_ask_spread_pct,
+                                'net_credit': net_credit,
+                                'extrinsic': extrinsic,
+                                'extrinsic_per_day': extrinsic_per_day,
+                                'theta': opt_data.theta,
+                                'delta': opt_data.delta,
+                                'iv': opt_data.volatility,
+                                'open_interest': opt_data.openInterest,
+                                'apr': apr,
+                                'quality_score': quality_score,
+                                'days_gained': days_gained,
+                                'distance_pct': distance_pct,
+                                'intrinsic': intrinsic
+                            })
+
+                # Print filtering statistics
+                print(f"  Options checked: {total_options_checked}")
+                print(f"  Filtered by expiration: {filtered_by_expiration}")
+                print(f"  Filtered by pricing: {filtered_by_pricing}")
+                print(f"  Filtered by spread: {filtered_by_spread}")
+                print(f"  Filtered by debit/ITM/distance: {filtered_by_debit}")
+                print(f"  Viable candidates: {len(rollover_candidates)}")
+
+                # Show DTE distribution of candidates
+                if rollover_candidates:
+                    dte_counts = {}
+                    for c in rollover_candidates:
+                        dte = c['dte']
+                        if dte not in dte_counts:
+                            dte_counts[dte] = 0
+                        dte_counts[dte] += 1
+                    print(f"  DTE distribution: {sorted(dte_counts.items())}")
+
+                # Sort by quality score and return top candidate
+                if rollover_candidates:
+                    rollover_candidates.sort(key=lambda x: x['quality_score'], reverse=True)
+
+                    # Show top 5 candidates for comparison
+                    print(f"  Top 5 rollover candidates:")
+                    for i, cand in enumerate(rollover_candidates[:5]):
+                        print(f"    {i+1}. DTE={cand['dte']}, Strike=${cand['strike']:.2f}, Extrinsic=${cand['extrinsic']:.2f} (${cand['extrinsic_per_day']:.3f}/day), "
+                              f"Distance={cand['distance_pct']:.1f}%, Spread={cand['bid_ask_spread_pct']:.1f}%, Quality={cand['quality_score']:.1f}")
+
+                    best = rollover_candidates[0]
+
+                    return {
+                        'symbol': f"{current_option.underlying}_{best['expiration'].strftime('%y%m%d')}{current_option.callput[0]}{best['strike']:g}",
+                        'strike': best['strike'],
+                        'expiration': best['expiration'],
+                        'dte': best['dte'],
+                        'net_credit': best['net_credit'],
+                        'extrinsic': best['extrinsic'],
+                        'extrinsic_per_day': best['extrinsic_per_day'],
+                        'apr': best['apr'],
+                        'bid_ask_spread': best['bid_ask_spread_pct'],
+                        'theta': best['theta'],
+                        'iv': best['iv'],
+                        'open_interest': best['open_interest'],
+                        'quality_score': best['quality_score'],
+                        'days_gained': best['days_gained'],
+                        'distance_pct': best['distance_pct']
+                    }
+
+                # No candidates found in this attempt, continue to next attempt (or return None if last attempt)
+
+            except Exception as e:
+                print(f"  Error in attempt {attempt}: {e}")
+                continue
+
+        # If we reach here, no candidates found in any attempt
+        print(f"  No viable rollover candidates found after all attempts")
+        return None
+
 
 def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
     # Create options table
     rows = []
+    print(f"\n=== Building Option Table ===")
+    print(f"Total positions in portfolio: {len(portf.portf_list)}")
+
     for pos in portf.portf_list:
         if pos.equity_type != "OPTION":
             continue
         option = pos.property
+        print(f"\nProcessing: {option.underlying} {option.callput} {option.strike} Qty={pos.quantity} Action={option.actionNeed}")
         apr = round(
             (option.extrinsic * 100 / (option.strike * 100))
             * (365 / (option.daysToExpiration + 1))
             * 100
             * (-1 if pos.quantity > 0 else 1)
         )
+        xstd_value = option.Xstd * (-1 if option.itm == 1 else 1)
+
+        # Check for rollover opportunity when Action is 1
+        rollover_recommendation = None
+        if option.actionNeed == 1 and pos.quantity < 0:  # Only for short positions with action needed
+            print(f"Checking rollover for {option.underlying} {option.callput} {option.strike} (Action=1)")
+            rollover_recommendation = schwab.find_best_rollover(option, pos.quantity, option.actionNeed)
+            if rollover_recommendation:
+                print(f"  -> Found rollover: {rollover_recommendation['symbol']} Credit=${rollover_recommendation['net_credit']:.2f} APR={rollover_recommendation['apr']:.1f}%")
+            else:
+                print(f"  -> No suitable rollover found")
+
+        # Build base row with Roll_To placeholder (will be filled based on rollover recommendation)
         row = {
             "Symbol": option.underlying,
-            "Action": option.actionNeed,
             "ITM": option.itm,
+            "Roll_To": "",  # Placeholder, filled below
+            "Action": option.actionNeed,
             "Price": option.price,
             "DaysToExp": option.daysToExpiration,
             "DaysToER": option.daysToER,
             "Quantity": pos.quantity,
             "Extrinsic": option.extrinsic,
             "APR(%)": apr,
+            "APR*Xstd": apr * xstd_value,
             "CallPut": option.callput,
             "Strike": option.strike,
             "Underlying": option.underlyingPrice,
-            "Xstd": option.Xstd,
+            "Xstd": xstd_value,
             "Exp": option.exp,
             "Delta": option.delta,
             "Gamma": option.gamma,
@@ -644,12 +972,64 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
             "Vega": option.vega,
             "OpenInterest": option.openInterest,
             "Volatility": option.volatility,
+            "Roll_Strike": "",  # Rollover columns placeholders
+            "Roll_DTE": "",
+            "Roll_Credit": "",
+            "Roll_Extrinsic": "",
+            "Roll_Ext/Day": "",
+            "Roll_Distance(%)": "",
+            "Roll_APR(%)": "",
+            "Roll_BidAskSpread(%)": "",
+            "Roll_Theta": "",
+            "Roll_IV": "",
+            "Roll_OI": "",
+            "Roll_Quality": "",
         }
+
+        # Fill rollover columns if recommendation exists
+        if rollover_recommendation:
+            print(f"  Adding rollover recommendation to row: {rollover_recommendation['symbol']}")
+            # Remove ticker prefix from Roll_To (e.g., BIDU_251219C131 -> 251219C131)
+            roll_to_symbol = rollover_recommendation['symbol']
+            if '_' in roll_to_symbol:
+                roll_to_symbol = roll_to_symbol.split('_', 1)[1]  # Remove everything before first underscore
+            row["Roll_To"] = roll_to_symbol
+            row["Roll_Strike"] = rollover_recommendation['strike']
+            row["Roll_DTE"] = rollover_recommendation['dte']
+            row["Roll_Credit"] = round(rollover_recommendation['net_credit'], 2)
+            row["Roll_Extrinsic"] = round(rollover_recommendation['extrinsic'], 2)
+            row["Roll_Ext/Day"] = round(rollover_recommendation['extrinsic_per_day'], 3)
+            row["Roll_Distance(%)"] = round(rollover_recommendation['distance_pct'], 1)
+            row["Roll_APR(%)"] = round(rollover_recommendation['apr'], 1)
+            row["Roll_BidAskSpread(%)"] = round(rollover_recommendation['bid_ask_spread'], 1)
+            row["Roll_Theta"] = round(rollover_recommendation['theta'], 2)
+            row["Roll_IV"] = round(rollover_recommendation['iv'], 2)
+            row["Roll_OI"] = rollover_recommendation['open_interest']
+            row["Roll_Quality"] = round(rollover_recommendation['quality_score'], 1)
+        else:
+            print(f"  No rollover recommendation")
+
         rows.append(row)
+        print(f"  Row added. Roll_To={row['Roll_To']}")
+
     df = pd.DataFrame.from_records(rows)
     df["Unit"] = 100
     df.sort_values(by=["DaysToExp", "Symbol"], inplace=True)
-    df.style.highlight_between(
+
+    print(f"\n=== DataFrame Summary ===")
+    print(f"Total rows: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
+    if 'Roll_To' in df.columns:
+        rollover_count = df[df['Roll_To'] != ''].shape[0]
+        print(f"Rollover recommendations found: {rollover_count}")
+        rollover_yes = df[df['Roll_To'] != '']
+        if len(rollover_yes) > 0:
+            print(f"\nRollover details:")
+            for idx, row in rollover_yes.iterrows():
+                print(f"  {row['Symbol']} {row['CallPut']} {row['Strike']}: Roll to {row['Roll_To']} for ${row['Roll_Credit']} credit ({row['Roll_APR(%)']}% APR)")
+
+    # Apply compact styling - narrow columns, no padding
+    styled_df = df.style.highlight_between(
         left=1, right=1, subset=["ITM"], props="background:#FFFF00"
     ).highlight_between(
         left=0, right=5, subset=["DaysToExp"], props="background:#a1eafb"
@@ -657,8 +1037,27 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
         left=0, right=5, subset=["DaysToER"], props="background:#a1eafb"
     ).format(
         precision=2
-    )
-    df.style.set_table_styles([dict(selector="th", props=[("max-width", "20px")])])
+    ).set_table_styles([
+        dict(selector="th", props=[
+            ("max-width", "fit-content"),
+            ("padding", "2px 4px"),
+            ("white-space", "nowrap"),
+            ("font-size", "11px")
+        ]),
+        dict(selector="td", props=[
+            ("max-width", "fit-content"),
+            ("padding", "2px 4px"),
+            ("white-space", "nowrap"),
+            ("font-size", "11px")
+        ]),
+        dict(selector="table", props=[
+            ("border-collapse", "collapse"),
+            ("width", "auto")
+        ])
+    ]).set_properties(**{
+        'text-align': 'left',
+        'white-space': 'nowrap'
+    })
 
     return df
 
@@ -763,8 +1162,8 @@ def esp(group_df):
 ib = IB()
 positions_ib = ib.get_positions()
 
-tradestation = TradeStation()
-positions_tradestation = tradestation.get_positions()
+#tradestation = TradeStation()
+#positions_tradestation = tradestation.get_positions()
 
 schwab = Schwab()
 positions_schwab = schwab.get_positions()
@@ -773,7 +1172,7 @@ portf = Portfolio()
 for positions in [
     positions_schwab,
     positions_fidelity,
-    positions_tradestation,
+#    positions_tradestation,
     positions_ib,
 ]:
     for pos in positions:
