@@ -42,10 +42,14 @@ from settings import (
 )
 import yfinance as yf
 
-UNIFIED_OPTION_PATTERN = r"([a-zA-Z]+)(\d*)_(\d+)([C|P])(\d+\.?\d*)"
+UNIFIED_OPTION_PATTERN = r"([a-zA-Z][a-zA-Z0-9]*)(\d*)_(\d+)([C|P])(\d+\.?\d*)"
 
 
 def getERdate2(symbol):
+    # Special case: Adjusted option symbols -> Actual ticker for API queries
+    if symbol == "TSLL1":
+        symbol = "TSLL"
+
     finnhub_client = finnhub.Client(api_key=FINNHUB_KEY)
     try:
         er_dates = finnhub_client.earnings_calendar(
@@ -94,8 +98,13 @@ class Option:
         return self.exp + timedelta(days=1) < datetime.now()
 
     def download_underlying_OHLC(self):
+        # Special case: Adjusted option symbols -> Actual ticker for API queries
+        underlying = self.underlying
+        if underlying == "TSLL1":
+            underlying = "TSLL"
+
         return yf.download(
-            tickers=self.underlying,
+            tickers=underlying,
             start=datetime.today() - timedelta(days=365),
             interval="1d",
         )
@@ -141,7 +150,7 @@ class IB(Exchange):
     def __init__(self):
         super().__init__()
         self.money_pattern = r"^USD*"
-        self.option_pattern = r"^([A-Z]+).*\[\1\s+(\d{6})([CP])(\d{8})\s+(\d+)\]$"
+        self.option_pattern = r"^([A-Z][A-Z0-9]*).*\[\1\s+(\d{6})([CP])(\d{8})\s+(\d+)\]$"
         return
 
     def get_positions(self):
@@ -224,7 +233,7 @@ class Fidelity(Exchange):
     def __init__(self):
         super().__init__()
         self.money_pattern = r"^FDRXX.*|^SPAXX.*"
-        self.option_pattern = r"[^a-zA-Z]*([a-zA-Z]*)(\d{6})([C|P]\d+\.?\d*)"
+        self.option_pattern = r"[^a-zA-Z0-9]*([a-zA-Z0-9]+)(\d{6})([C|P]\d+\.?\d*)"
         return
 
     def get_positions(self):
@@ -234,14 +243,18 @@ class Fidelity(Exchange):
             f"{curr_dir}/fidelity18-roth.csv",
             f"{curr_dir}/fidelity20.csv",
         ]:
-            df = pd.read_csv(f)
+            print(f"[DEBUG Fidelity] Reading file: {f}")
+            df = pd.read_csv(f, encoding='utf-8-sig', index_col=False)
             for s in df["Symbol"].dropna().values:
                 if not s or s == "Pending Activity":
                     continue
 
+                print(f"[DEBUG Fidelity] Processing symbol: '{s}'")
+
                 # if it is money market (cash)
                 m = re.compile(self.money_pattern).search(s)
                 if m:
+                    print(f"[DEBUG Fidelity]   -> Matched as CASH")
                     pos = Position(
                         s,
                         "CASH",
@@ -259,9 +272,15 @@ class Fidelity(Exchange):
                 m = re.compile(self.option_pattern).search(s)
                 if m:
                     o = m.group(1) + "_" + m.group(2) + m.group(3)
-                    pos = Position(
-                        o, "OPTION", df.loc[df["Symbol"] == s, "Quantity"].values[0]
-                    )
+                    qty = df.loc[df['Symbol'] == s, 'Quantity'].values[0]
+                    print(f"[DEBUG Fidelity]   -> Matched as OPTION: '{o}' (Qty: {qty})")
+
+                    # Verify it matches UNIFIED_OPTION_PATTERN
+                    if not re.compile(UNIFIED_OPTION_PATTERN).search(o):
+                        print(f"[DEBUG Fidelity]   WARNING: Unified symbol '{o}' does NOT match UNIFIED_OPTION_PATTERN!")
+                        print(f"[DEBUG Fidelity]   This option will likely fail during Option() initialization")
+
+                    pos = Position(o, "OPTION", qty)
                     self.pos_list.append(pos)
                     continue
                 else:
@@ -271,61 +290,13 @@ class Fidelity(Exchange):
                         or df.loc[df["Symbol"] == s, "Account Name"].values[0].lower()
                         == "TRADITIONAL IRA".lower()
                     ):
+                        print(f"[DEBUG Fidelity]   -> Matched as STOCK")
                         pos = Position(
                             s, "STOCK", df.loc[df["Symbol"] == s, "Quantity"].values[0]
                         )
                         self.pos_list.append(pos)
-
-        return self.pos_list
-
-    def get_positions(self):
-        curr_dir = os.path.dirname(__file__)
-        for f in [
-            f"{curr_dir}/fidelity18-ira.csv",
-            f"{curr_dir}/fidelity18-roth.csv",
-            f"{curr_dir}/fidelity20.csv",
-        ]:
-            df = pd.read_csv(f)
-            for s in df["Symbol"].dropna().values:
-                if not s or s == "Pending Activity":
-                    continue
-
-                # if it is money market (cash)
-                m = re.compile(self.money_pattern).search(s)
-                if m:
-                    pos = Position(
-                        s,
-                        "CASH",
-                        int(
-                            float(
-                                df.loc[df["Symbol"] == s, "Current Value"]
-                                .values[0]
-                                .strip("$")
-                            )
-                        ),
-                    )
-                    self.pos_list.append(pos)
-                    continue
-
-                m = re.compile(self.option_pattern).search(s)
-                if m:
-                    o = m.group(1) + "_" + m.group(2) + m.group(3)
-                    pos = Position(
-                        o, "OPTION", df.loc[df["Symbol"] == s, "Quantity"].values[0]
-                    )
-                    self.pos_list.append(pos)
-                    continue
-                else:
-                    if s and (
-                        df.loc[df["Symbol"] == s, "Account Name"].values[0].lower()
-                        == "ROTH IRA".lower()
-                        or df.loc[df["Symbol"] == s, "Account Name"].values[0].lower()
-                        == "TRADITIONAL IRA".lower()
-                    ):
-                        pos = Position(
-                            s, "STOCK", df.loc[df["Symbol"] == s, "Quantity"].values[0]
-                        )
-                        self.pos_list.append(pos)
+                    else:
+                        print(f"[DEBUG Fidelity]   -> SKIPPED (no pattern match or wrong account type)")
 
         return self.pos_list
 
@@ -334,7 +305,7 @@ class TradeStation(Exchange):
     def __init__(self):
         super().__init__()
         self.access_token = ""
-        self.option_pattern = r"([a-zA-Z]+)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
+        self.option_pattern = r"([a-zA-Z][a-zA-Z0-9]*)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
         self.base_url = "https://api.tradestation.com"
         self.auth()
 
@@ -419,7 +390,7 @@ class Schwab(Exchange):
         self.access_token = ""
         self.account_number = []
         self.base_url = "https://api.schwabapi.com"
-        self.option_pattern = r"([a-zA-Z]+)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
+        self.option_pattern = r"([a-zA-Z][a-zA-Z0-9]*)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
         self.auth()
 
     def auth(self) -> str:
@@ -493,6 +464,11 @@ class Schwab(Exchange):
     def schwab_option_symbol(self, symbol):
         m = re.compile(UNIFIED_OPTION_PATTERN).search(symbol)
         underlying = m.group(1)
+
+        # Special case: Adjusted option symbols -> Actual ticker for API queries
+        if underlying == "TSLL1":
+            underlying = "TSLL"
+
         exp = m.group(2)
         callput = m.group(3)
         strike = int(float(m.group(4)) * 1000)
@@ -533,6 +509,11 @@ class Schwab(Exchange):
     def get_chain_obj(self, option: Option):
         # https://api.schwabapi.com/marketdata/v1/chains?symbol=JD&contractType=CALL&strike=32&fromDate=2024-05-24&toDate=2024-05-24
         underlying = option.underlying
+
+        # Special case: Adjusted option symbols -> Actual ticker for API queries
+        if underlying == "TSLL1":
+            underlying = "TSLL"
+
         exp = option.exp.strftime("%Y-%m-%d")
         callput = option.callput
         strike = f"{option.strike:g}"
@@ -554,6 +535,10 @@ class Schwab(Exchange):
             to_date: end date (defaults to days_out)
             days_out: number of days to fetch (default 45, can extend to 90+ for fallback)
         """
+        # Special case: TSLL1 -> TSLL for API queries
+        if underlying == "TSLL1":
+            underlying = "TSLL"
+
         if from_date is None:
             from_date = datetime.today().strftime("%Y-%m-%d")
         if to_date is None:
@@ -582,8 +567,18 @@ class Schwab(Exchange):
             return pos
         option = Option(pos.symbol)
         if option.is_expired():
+            print(f"[DEBUG]   Option is expired: {pos.symbol}")
             return None
-        chain_obj = self.get_chain_obj(option)
+
+        try:
+            chain_obj = self.get_chain_obj(option)
+            if not chain_obj:
+                print(f"[DEBUG]   Failed to get chain data for: {pos.symbol}")
+                return None
+        except Exception as e:
+            print(f"[DEBUG]   Exception getting chain for {pos.symbol}: {e}")
+            return None
+
         option.underlyingPrice = chain_obj.underlyingPrice
         if option.callput == "CALL":
             option_data = (
@@ -1176,9 +1171,13 @@ for positions in [
     positions_ib,
 ]:
     for pos in positions:
+        print(f"[DEBUG] Processing position: {pos.symbol} ({pos.equity_type})")
         pos = schwab.load_option_properties(pos)
         if pos:
+            print(f"[DEBUG]   -> Added to portfolio")
             portf.add(pos)
+        else:
+            print(f"[DEBUG]   -> FILTERED OUT (likely expired or failed to load)")
 
 
 option_df = build_option_table(portf, schwab)
