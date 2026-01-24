@@ -21,11 +21,16 @@ from pretty_html_table import build_table
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
 from smtplib import SMTP
 import smtplib
 import sys
 import os
 import base64
+import io
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for email generation
+import matplotlib.pyplot as plt
 from settings import (
     SCHWAB_APP_KEY,
     SCHWAB_APP_SECRET,
@@ -1057,6 +1062,79 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
     return df
 
 
+def build_sold_put_table(portf: Portfolio) -> pd.DataFrame:
+    """Build a table showing all sold (short) PUT options with totals."""
+    rows = []
+    total_quantity = 0
+    total_secured_cash = 0
+
+    for pos in portf.portf_list:
+        if pos.equity_type != "OPTION":
+            continue
+        option = pos.property
+        # Only include short PUT positions (quantity < 0 and callput == PUT)
+        if option.callput != "PUT" or pos.quantity >= 0:
+            continue
+
+        # Calculate secured cash for this position (strike * 100 * |quantity|)
+        secured_cash = option.strike * 100 * abs(pos.quantity)
+        total_quantity += abs(pos.quantity)
+        total_secured_cash += secured_cash
+
+        apr = round(
+            (option.extrinsic * 100 / (option.strike * 100))
+            * (365 / (option.daysToExpiration + 1))
+            * 100
+        )
+        xstd_value = option.Xstd * (-1 if option.itm == 1 else 1)
+
+        row = {
+            "Symbol": option.underlying,
+            "Strike": option.strike,
+            "Exp": option.exp.strftime("%Y-%m-%d"),
+            "DaysToExp": option.daysToExpiration,
+            "Quantity": pos.quantity,
+            "SecuredCash": secured_cash,
+            "Price": option.price,
+            "Underlying": option.underlyingPrice,
+            "ITM": option.itm,
+            "Extrinsic": option.extrinsic,
+            "APR(%)": apr,
+            "Xstd": xstd_value,
+            "Delta": option.delta,
+            "Theta": option.theta,
+            "DaysToER": option.daysToER,
+            "Action": option.actionNeed,
+        }
+        rows.append(row)
+
+    df = pd.DataFrame.from_records(rows)
+    if len(df) > 0:
+        df.sort_values(by=["DaysToExp", "Symbol"], inplace=True)
+        # Add summary row
+        summary_row = {
+            "Symbol": "TOTAL",
+            "Strike": "",
+            "Exp": "",
+            "DaysToExp": "",
+            "Quantity": -total_quantity,
+            "SecuredCash": total_secured_cash,
+            "Price": "",
+            "Underlying": "",
+            "ITM": "",
+            "Extrinsic": "",
+            "APR(%)": "",
+            "Xstd": "",
+            "Delta": "",
+            "Theta": "",
+            "DaysToER": "",
+            "Action": "",
+        }
+        df = pd.concat([df, pd.DataFrame([summary_row])], ignore_index=True)
+
+    return df
+
+
 def build_stock_table(portf):
     rows = []
     for pos in portf.portf_list:
@@ -1094,12 +1172,186 @@ def build_cash_table(portf):
     return df
 
 
-def send_email(option_df, esp, stock_df, cash_df):
+def build_tsll_put_histogram(portf: Portfolio) -> bytes:
+    """Build a histogram of TSLL short PUT and CALL positions (x: strike, y: quantity).
+    Returns PNG image bytes for email attachment."""
+    put_data = []  # List of (strike, quantity, dte, secured_cash)
+    call_data = []  # List of (strike, quantity, dte)
+    tsll_price = None
+
+    for pos in portf.portf_list:
+        if pos.equity_type != "OPTION":
+            continue
+        option = pos.property
+        # Only include TSLL or TSLL1 positions
+        if option.underlying not in ["TSLL", "TSLL1"]:
+            continue
+        # Only include short positions (quantity < 0)
+        if pos.quantity >= 0:
+            continue
+
+        # Capture the underlying price (should be same for all TSLL options)
+        if tsll_price is None:
+            tsll_price = option.underlyingPrice
+
+        qty = abs(pos.quantity)
+        dte = option.daysToExpiration
+
+        if option.callput == "PUT":
+            secured_cash = option.strike * 100 * qty
+            put_data.append((option.strike, qty, dte, secured_cash))
+        elif option.callput == "CALL":
+            call_data.append((option.strike, qty, dte))
+
+    if not put_data and not call_data:
+        return None  # No TSLL short positions
+
+    # Calculate totals
+    total_put_qty = sum(d[1] for d in put_data) if put_data else 0
+    total_call_qty = sum(d[1] for d in call_data) if call_data else 0
+    total_secured_cash = sum(d[3] for d in put_data) if put_data else 0
+
+    # Group data by strike for stacked bars
+    # PUT: {strike: [(qty, dte, secured_cash), ...]} sorted by DTE ascending
+    put_by_strike = {}
+    for d in put_data:
+        strike, qty, dte, secured = d
+        if strike not in put_by_strike:
+            put_by_strike[strike] = []
+        put_by_strike[strike].append((qty, dte, secured))
+    # Sort each strike's data by DTE ascending (near expiry first/bottom)
+    for strike in put_by_strike:
+        put_by_strike[strike].sort(key=lambda x: x[1])
+
+    # CALL: {strike: [(qty, dte), ...]} sorted by DTE ascending
+    call_by_strike = {}
+    for d in call_data:
+        strike, qty, dte = d
+        if strike not in call_by_strike:
+            call_by_strike[strike] = []
+        call_by_strike[strike].append((qty, dte))
+    for strike in call_by_strike:
+        call_by_strike[strike].sort(key=lambda x: x[1])
+
+    # Get unique DTEs to create discrete color mapping
+    all_unique_dtes = sorted(set(d[2] for d in put_data) | set(d[2] for d in call_data))
+    num_dtes = len(all_unique_dtes)
+    dte_to_rank = {dte: i for i, dte in enumerate(all_unique_dtes)}
+
+    # Color function: darker for near expiry (low DTE), lighter for far expiry (high DTE)
+    def get_put_color(dte):
+        if num_dtes <= 1:
+            return (0.1, 0.3, 0.7)  # Single DTE: medium dark blue
+        norm = dte_to_rank[dte] / (num_dtes - 1)
+        # Dark blue (0.0, 0.1, 0.5) to light blue (0.6, 0.8, 1.0)
+        r = 0.0 + norm * 0.6
+        g = 0.1 + norm * 0.7
+        b = 0.5 + norm * 0.5
+        return (r, g, b)
+
+    def get_call_color(dte):
+        if num_dtes <= 1:
+            return (0.9, 0.4, 0.0)  # Single DTE: medium dark orange
+        norm = dte_to_rank[dte] / (num_dtes - 1)
+        # Dark orange (0.7, 0.2, 0.0) to light orange (1.0, 0.8, 0.4)
+        r = 0.7 + norm * 0.3
+        g = 0.2 + norm * 0.6
+        b = 0.0 + norm * 0.4
+        return (r, g, b)
+
+    # Create the histogram
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Combine all strikes for x-axis positioning
+    all_strikes = sorted(set(put_by_strike.keys()) | set(call_by_strike.keys()))
+    bar_width = 0.35
+
+    # Track if we've added legend entries
+    put_legend_added = False
+    call_legend_added = False
+
+    # Create stacked bar charts for PUT
+    for strike in put_by_strike:
+        bottom = 0
+        for qty, dte, secured in put_by_strike[strike]:
+            color = get_put_color(dte)
+            label = 'Short PUT' if not put_legend_added else None
+            ax.bar(strike - bar_width/2, qty, width=bar_width, bottom=bottom,
+                   color=color, edgecolor='navy', label=label)
+            put_legend_added = True
+            # Add label in the middle of this segment
+            ax.annotate(f'{int(qty)}({dte}d)',
+                        xy=(strike - bar_width/2, bottom + qty/2),
+                        ha='center', va='center', fontsize=8, fontweight='bold', color='white')
+            bottom += qty
+
+    # Create stacked bar charts for CALL
+    for strike in call_by_strike:
+        bottom = 0
+        for qty, dte in call_by_strike[strike]:
+            color = get_call_color(dte)
+            label = 'Short CALL' if not call_legend_added else None
+            ax.bar(strike + bar_width/2, qty, width=bar_width, bottom=bottom,
+                   color=color, edgecolor='darkred', label=label)
+            call_legend_added = True
+            # Add label in the middle of this segment
+            ax.annotate(f'{int(qty)}({dte}d)',
+                        xy=(strike + bar_width/2, bottom + qty/2),
+                        ha='center', va='center', fontsize=8, fontweight='bold', color='white')
+            bottom += qty
+
+    # Add vertical line for current TSLL price
+    if tsll_price:
+        ax.axvline(x=tsll_price, color='red', linestyle='--', linewidth=2, label=f'TSLL Price: ${tsll_price:.2f}')
+
+    ax.set_xlabel('Strike Price ($)', fontsize=12)
+    ax.set_ylabel('Quantity (Contracts)', fontsize=12)
+    current_datetime = datetime.now().strftime('%Y-%m-%d %A %H:%M:%S')
+    ax.set_title(f'TSLL Short Options by Strike\n{current_datetime}', fontsize=14, fontweight='bold')
+    ax.set_xticks(all_strikes)
+    ax.set_xticklabels([f'${s:g}' for s in all_strikes], rotation=45, ha='right')
+    ax.grid(axis='y', alpha=0.3)
+
+    # Add summary text box in top right
+    summary_text = f'Total Short PUT: {total_put_qty}\nTotal Short CALL: {total_call_qty}\nPUT Secured Cash: ${total_secured_cash:,.0f}'
+    props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
+    ax.text(0.98, 0.97, summary_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', horizontalalignment='right', bbox=props)
+
+    # Add legend below the summary box
+    ax.legend(loc='upper right', fontsize=10, bbox_to_anchor=(0.99, 0.75))
+
+    # Ensure y-axis shows integers
+    ax.yaxis.set_major_locator(plt.MaxNLocator(integer=True))
+
+    plt.tight_layout()
+
+    # Save to bytes for email attachment
+    buffer = io.BytesIO()
+    plt.savefig(buffer, format='png', dpi=100, bbox_inches='tight')
+    buffer.seek(0)
+    img_bytes = buffer.getvalue()
+    plt.close(fig)
+
+    return img_bytes  # Return raw bytes for email attachment
+
+
+def send_email(option_df, esp, stock_df, cash_df, sold_put_df, tsll_histogram):
     recipients = ["omnimahui@gmail.com"]
     emaillist = [elem.strip().split(",") for elem in recipients]
-    msg = MIMEMultipart()
+    msg = MIMEMultipart('related')  # Use 'related' for inline images
     msg["Subject"] = "Option Portfolio"
     msg["From"] = "omnimahui@gmail.com"
+
+    # Build sold PUT table HTML
+    sold_put_html = ""
+    if len(sold_put_df) > 0:
+        sold_put_html = "<h3>Sold PUT Positions</h3>" + build_table(sold_put_df, "blue_light")
+
+    # Build TSLL histogram HTML with CID reference
+    tsll_hist_html = ""
+    if tsll_histogram:
+        tsll_hist_html = '<h3>TSLL Short Options Distribution</h3><img src="cid:tsll_histogram" alt="TSLL Short Options Histogram"/>'
 
     html = """\
     <html>
@@ -1109,16 +1361,32 @@ def send_email(option_df, esp, stock_df, cash_df):
         {1}
         {2}
         {3}
+        {4}
+        {5}
       </body>
     </html>
     """.format(
         build_table(option_df, "blue_light"),
+        sold_put_html,
+        tsll_hist_html,
         build_table(esp, "blue_light"),
         build_table(stock_df, "blue_light"),
         build_table(cash_df, "blue_light"),
     )
+
+    # Create alternative part for HTML
+    msg_alternative = MIMEMultipart('alternative')
+    msg.attach(msg_alternative)
+
     part1 = MIMEText(html, "html")
-    msg.attach(part1)
+    msg_alternative.attach(part1)
+
+    # Attach the histogram image with Content-ID
+    if tsll_histogram:
+        img = MIMEImage(tsll_histogram)
+        img.add_header('Content-ID', '<tsll_histogram>')
+        img.add_header('Content-Disposition', 'inline', filename='tsll_put_histogram.png')
+        msg.attach(img)
 
     smtp = smtplib.SMTP(SMTP_SERVER, port=SMTP_PORT)
     smtp.ehlo()  # send the extended hello to our server
@@ -1183,8 +1451,10 @@ for positions in [
 option_df = build_option_table(portf, schwab)
 stock_df = build_stock_table(portf)
 cash_df = build_cash_table(portf)
+sold_put_df = build_sold_put_table(portf)
+tsll_histogram = build_tsll_put_histogram(portf)
 total_df = pd.concat([option_df, stock_df], join="outer").fillna(0)
 esp = total_df.groupby("Symbol").apply(esp).astype(int)
 esp.reset_index(inplace=True)
 
-send_email(option_df, esp, stock_df, cash_df)
+send_email(option_df, esp, stock_df, cash_df, sold_put_df, tsll_histogram)
