@@ -44,6 +44,7 @@ from settings import (
     TRADESTATION_KEY,
     TRADESTATION_SECRET,
     TRADESTATION_ACCOUNTID,
+    FIDELITY_CREDENTIALS,
 )
 import yfinance as yf
 
@@ -116,10 +117,11 @@ class Option:
 
 
 class Position:
-    def __init__(self, symbol, equity_type, quantity):
+    def __init__(self, symbol, equity_type, quantity, account=""):
         self.symbol = symbol
         self.equity_type = equity_type
         self.quantity = quantity
+        self.account = account
         self.property = None
 
 
@@ -130,7 +132,9 @@ class Portfolio:
 
     def add(self, new_pos: Position):
         for pos in self.portf_list:
-            if pos.symbol == new_pos.symbol and pos.equity_type == new_pos.equity_type:
+            if (pos.symbol == new_pos.symbol
+                    and pos.equity_type == new_pos.equity_type
+                    and pos.account == new_pos.account):
                 pos.quantity += new_pos.quantity
                 return
 
@@ -164,6 +168,18 @@ class IB(Exchange):
             f"{curr_dir}/IB.csv",
         ]:
             df = pd.read_csv(f, header=1)
+            # Try to extract last 3 digits of account number from the CSV header row
+            acct_label = "IB"
+            try:
+                header_df = pd.read_csv(f, header=None, nrows=1)
+                for cell in header_df.values.flatten():
+                    digits = re.sub(r'\D', '', str(cell))
+                    if len(digits) >= 3:
+                        acct_label = digits[-3:]
+                        break
+            except Exception:
+                pass
+
             for s in df["Financial Instrument Description"].dropna().values:
                 if s in ["Cash Balances", "CNH", "Total (in USD)"]:
                     continue
@@ -181,6 +197,7 @@ class IB(Exchange):
                                 ].values[0]
                             )
                         ),
+                        acct_label,
                     )
                     self.pos_list.append(pos)
                     continue
@@ -200,6 +217,7 @@ class IB(Exchange):
                         df.loc[
                             df["Financial Instrument Description"] == s, "Position"
                         ].values[0],
+                        acct_label,
                     )
                     self.pos_list.append(pos)
                     continue
@@ -228,6 +246,7 @@ class IB(Exchange):
                             df.loc[
                                 df["Financial Instrument Description"] == s, "Position"
                             ].values[0],
+                            acct_label,
                         )
                         self.pos_list.append(pos)
 
@@ -238,11 +257,98 @@ class Fidelity(Exchange):
     def __init__(self):
         super().__init__()
         self.money_pattern = r"^FDRXX.*|^SPAXX.*"
-        self.option_pattern = r"[^a-zA-Z0-9]*([a-zA-Z0-9]+)(\d{6})([C|P]\d+\.?\d*)"
-        return
+        # handles optional leading '-' (short), optional space between ticker and date
+        self.option_pattern = r"[^a-zA-Z0-9]*([a-zA-Z0-9]+)\s*(\d{6})([C|P]\d+\.?\d*)"
 
     def get_positions(self):
+        active = [(u, p) for u, p in FIDELITY_CREDENTIALS if u and p]
+        if active:
+            return self._get_positions_browser(active)
+        return self._get_positions_csv()
+
+    def _get_positions_browser(self, credentials: list):
+        """Fetch positions using saved browser sessions (headless, no prompts).
+        Run fidelity-login.py first to create the session files.
+        """
+        from fidelity.fidelity import FidelityAutomation
+        curr_dir = os.path.dirname(os.path.abspath(__file__))
+
+        for idx, (username, _password) in enumerate(credentials):
+            session_file = os.path.join(curr_dir, f"Fidelity_acct{idx}.json")
+            if not os.path.exists(session_file):
+                print(f"[Fidelity] Session file not found for account {idx} ({username}). "
+                      f"Run fidelity-login.py first.")
+                continue
+
+            fid = FidelityAutomation(
+                headless=True,
+                save_state=True,
+                title=f"acct{idx}",
+                profile_path=curr_dir,
+            )
+            try:
+                print(f"[Fidelity] Loading positions for {username} ...")
+                account_dict = fid.getAccountInfo()
+                if not account_dict:
+                    print(f"[Fidelity] Session expired for {username}. Run fidelity-login.py to refresh.")
+                    continue
+                self._parse_browser_account_dict(account_dict)
+                print(f"[Fidelity] {username}: {len(account_dict)} account(s) loaded")
+            except Exception as e:
+                print(f"[Fidelity] Error for {username}: {e}. Run fidelity-login.py to refresh session.")
+            finally:
+                fid.close_browser()
+
+        return self.pos_list
+
+    def _parse_browser_account_dict(self, account_dict: dict):
+        """Convert FidelityAutomation.account_dict to Position objects."""
+        opt_re = re.compile(self.option_pattern)
+        mm_re  = re.compile(self.money_pattern)
+
+        for account_num, acct_data in account_dict.items():
+            acct_label = re.sub(r'\D', '', str(account_num))[-3:] or "FID"
+            cash_total = 0.0
+
+            for stock in acct_data.get("stocks", []):
+                ticker   = str(stock["ticker"])
+                quantity = float(stock["quantity"])
+                value    = float(stock["value"])
+
+                # fidelity_api strips '-' from Quantity; detect short via ticker prefix
+                is_short = ticker.startswith("-")
+
+                # Money market / cash equivalent
+                if mm_re.search(ticker):
+                    cash_total += value
+                    continue
+
+                # Option
+                m = opt_re.search(ticker)
+                if m:
+                    underlying = m.group(1)
+                    exp        = m.group(2)
+                    cp_strike  = m.group(3)  # e.g. "C14.0"
+                    o = f"{underlying}_{exp}{cp_strike}"
+                    qty = -quantity if is_short else quantity
+                    self.pos_list.append(Position(o, "OPTION", qty, acct_label))
+                    continue
+
+                # Plain stock — skip ticker prefixed with '-' that didn't match option
+                clean = ticker.lstrip("-").strip()
+                if clean:
+                    qty = -quantity if is_short else quantity
+                    self.pos_list.append(Position(clean, "STOCK", qty, acct_label))
+
+            if cash_total > 0:
+                self.pos_list.append(
+                    Position("Fidelity", "CASH", int(cash_total), acct_label)
+                )
+
+    def _get_positions_csv(self):
         curr_dir = os.path.dirname(__file__)
+        opt_re = re.compile(self.option_pattern)
+        mm_re  = re.compile(self.money_pattern)
         for f in [
             f"{curr_dir}/fidelity18-ira.csv",
             f"{curr_dir}/fidelity18-roth.csv",
@@ -250,58 +356,48 @@ class Fidelity(Exchange):
         ]:
             print(f"[DEBUG Fidelity] Reading file: {f}")
             df = pd.read_csv(f, encoding='utf-8-sig', index_col=False)
+
+            acct_label = re.sub(r'\D', '', os.path.basename(f))[-3:] or "FID"
+            if "Account Number" in df.columns:
+                acct_nums = df["Account Number"].dropna().astype(str)
+                if len(acct_nums) > 0:
+                    acct_label = re.sub(r'\D', '', acct_nums.iloc[0])[-3:] or acct_label
+
             for s in df["Symbol"].dropna().values:
                 if not s or s == "Pending Activity":
                     continue
 
                 print(f"[DEBUG Fidelity] Processing symbol: '{s}'")
 
-                # if it is money market (cash)
-                m = re.compile(self.money_pattern).search(s)
-                if m:
+                if mm_re.search(s):
                     print(f"[DEBUG Fidelity]   -> Matched as CASH")
                     pos = Position(
                         s,
                         "CASH",
-                        int(
-                            float(
-                                df.loc[df["Symbol"] == s, "Current Value"]
-                                .values[0]
-                                .strip("$")
-                            )
-                        ),
+                        int(float(df.loc[df["Symbol"] == s, "Current Value"].values[0].strip("$"))),
+                        acct_label,
                     )
                     self.pos_list.append(pos)
                     continue
 
-                m = re.compile(self.option_pattern).search(s)
+                m = opt_re.search(s)
                 if m:
                     o = m.group(1) + "_" + m.group(2) + m.group(3)
                     qty = df.loc[df['Symbol'] == s, 'Quantity'].values[0]
                     print(f"[DEBUG Fidelity]   -> Matched as OPTION: '{o}' (Qty: {qty})")
-
-                    # Verify it matches UNIFIED_OPTION_PATTERN
                     if not re.compile(UNIFIED_OPTION_PATTERN).search(o):
-                        print(f"[DEBUG Fidelity]   WARNING: Unified symbol '{o}' does NOT match UNIFIED_OPTION_PATTERN!")
-                        print(f"[DEBUG Fidelity]   This option will likely fail during Option() initialization")
-
-                    pos = Position(o, "OPTION", qty)
-                    self.pos_list.append(pos)
+                        print(f"[DEBUG Fidelity]   WARNING: '{o}' does NOT match UNIFIED_OPTION_PATTERN!")
+                    self.pos_list.append(Position(o, "OPTION", qty, acct_label))
                     continue
+
+                acct_name = df.loc[df["Symbol"] == s, "Account Name"].values[0].lower()
+                if s and acct_name in ("roth ira", "traditional ira"):
+                    print(f"[DEBUG Fidelity]   -> Matched as STOCK")
+                    self.pos_list.append(
+                        Position(s, "STOCK", df.loc[df["Symbol"] == s, "Quantity"].values[0], acct_label)
+                    )
                 else:
-                    if s and (
-                        df.loc[df["Symbol"] == s, "Account Name"].values[0].lower()
-                        == "ROTH IRA".lower()
-                        or df.loc[df["Symbol"] == s, "Account Name"].values[0].lower()
-                        == "TRADITIONAL IRA".lower()
-                    ):
-                        print(f"[DEBUG Fidelity]   -> Matched as STOCK")
-                        pos = Position(
-                            s, "STOCK", df.loc[df["Symbol"] == s, "Quantity"].values[0]
-                        )
-                        self.pos_list.append(pos)
-                    else:
-                        print(f"[DEBUG Fidelity]   -> SKIPPED (no pattern match or wrong account type)")
+                    print(f"[DEBUG Fidelity]   -> SKIPPED")
 
         return self.pos_list
 
@@ -393,7 +489,8 @@ class Schwab(Exchange):
     def __init__(self):
         super().__init__()
         self.access_token = ""
-        self.account_number = []
+        self.account_number = []        # hash values used for API calls
+        self.account_number_plain = []  # last-3 digits of real account numbers
         self.base_url = "https://api.schwabapi.com"
         self.option_pattern = r"([a-zA-Z][a-zA-Z0-9]*)(\d*)\s+(\d+)([C|P])(\d+\.?\d*)"
         self.auth()
@@ -423,6 +520,8 @@ class Schwab(Exchange):
         response = self.send_request(url)
         for i in range(len(response)):
             self.account_number.append(response[i].hashValue)
+            plain = str(response[i].accountNumber)
+            self.account_number_plain.append(re.sub(r'\D', '', plain)[-3:] or str(i))
         return self.account_number
 
     def parse_positions(self, positions):
@@ -484,20 +583,22 @@ class Schwab(Exchange):
     def get_positions(self) -> dict:
         self.get_account_number_hash_value()
         self.pos_list = []
-        i = 0
-        for acct in self.account_number:
+        for i, acct in enumerate(self.account_number):
+            acct_label = self.account_number_plain[i] if i < len(self.account_number_plain) else str(i)
             url = f"{self.base_url}/trader/v1/accounts/{acct}?fields=positions"
             response = self.send_request(url)
             self.pos = self.parse_positions(response.securitiesAccount.positions)
+            for p in self.pos:
+                p.account = acct_label
             self.pos.append(
                 Position(
                     f"SchWab{i}",
                     "CASH",
                     response.securitiesAccount.initialBalances.cashBalance,
+                    acct_label,
                 )
             )
             self.pos_list.extend(self.pos)
-            i = i + 1
         return self.pos_list
 
     def get_quote_obj(self, symbol, equity_type):
@@ -951,6 +1052,7 @@ def build_option_table(portf: Portfolio, schwab: Schwab) -> str:
         # Build base row with Roll_To placeholder (will be filled based on rollover recommendation)
         row = {
             "Symbol": option.underlying,
+            "Acct": pos.account,
             "ITM": option.itm,
             "Roll_To": "",  # Placeholder, filled below
             "Action": option.actionNeed,
@@ -1090,6 +1192,7 @@ def build_sold_put_table(portf: Portfolio) -> pd.DataFrame:
 
         row = {
             "Symbol": option.underlying,
+            "Acct": pos.account,
             "Strike": option.strike,
             "Exp": option.exp.strftime("%Y-%m-%d"),
             "DaysToExp": option.daysToExpiration,
@@ -1142,6 +1245,7 @@ def build_stock_table(portf):
             continue
         row = {
             "Symbol": pos.symbol,
+            "Acct": pos.account,
             "Quantity": pos.quantity,
             "DaysToER": int(
                 (
@@ -1164,7 +1268,7 @@ def build_cash_table(portf):
     for pos in portf.portf_list:
         if pos.equity_type != "CASH":
             continue
-        row = {"Symbol": pos.symbol, "Quantity": pos.quantity}
+        row = {"Symbol": pos.symbol, "Acct": pos.account, "Quantity": pos.quantity}
         rows.append(row)
     df = pd.DataFrame.from_records(rows)
     new_row = {"Symbol": "Total", "Quantity": df["Quantity"].astype(float).sum()}
@@ -1178,7 +1282,14 @@ def build_tsll_put_histogram(portf: Portfolio) -> bytes:
     put_data = []  # List of (strike, quantity, dte, secured_cash)
     call_data = []  # List of (strike, quantity, dte)
     tsll_price = None
+    tsll_stock_position = 0  # Total TSLL stock shares
 
+    # First pass: collect TSLL stock positions
+    for pos in portf.portf_list:
+        if pos.equity_type == "STOCK" and pos.symbol in ["TSLL", "TSLL1"]:
+            tsll_stock_position += pos.quantity
+
+    # Second pass: collect option positions
     for pos in portf.portf_list:
         if pos.equity_type != "OPTION":
             continue
@@ -1313,7 +1424,8 @@ def build_tsll_put_histogram(portf: Portfolio) -> bytes:
     ax.grid(axis='y', alpha=0.3)
 
     # Add summary text box in top right
-    summary_text = f'Total Short PUT: {total_put_qty}\nTotal Short CALL: {total_call_qty}\nPUT Secured Cash: ${total_secured_cash:,.0f}'
+    tsll_market_value = (tsll_price or 0) * tsll_stock_position
+    summary_text = f'Total Short PUT: {total_put_qty}\nTotal Short CALL: {total_call_qty}\nPUT Secured Cash: ${total_secured_cash:,.0f}\nTSLL Position: {tsll_stock_position:,.0f} (${tsll_market_value:,.0f})'
     props = dict(boxstyle='round', facecolor='wheat', alpha=0.8)
     ax.text(0.98, 0.97, summary_text, transform=ax.transAxes, fontsize=10,
             verticalalignment='top', horizontalalignment='right', bbox=props)
